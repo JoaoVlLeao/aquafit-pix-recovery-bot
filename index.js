@@ -5,16 +5,15 @@ import pkg from "whatsapp-web.js";
 import chalk from "chalk";
 
 const { Client, LocalAuth } = pkg;
-
 const app = express();
 app.use(bodyParser.json());
 
-// ----------------------
-// INICIALIZA WHATSAPP
-// ----------------------
+// ==============================
+// CONFIGURAÇÃO DO WHATSAPP
+// ==============================
 const client = new Client({
   authStrategy: new LocalAuth({
-    dataPath: "./session_pix", // sessão separada
+    dataPath: "./session",
   }),
   puppeteer: {
     headless: true,
@@ -30,156 +29,149 @@ const client = new Client({
   },
 });
 
+// QR code controlado (a cada 2 minutos)
+let lastQRTime = 0;
 client.on("qr", (qr) => {
+  const now = Date.now();
+  if (now - lastQRTime < 120000) return;
+  lastQRTime = now;
+
   const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(
     qr
   )}`;
   console.log(chalk.cyan("\n📱 Escaneie o QR code no navegador:"));
   console.log(chalk.yellow(qrUrl));
-  console.log(chalk.gray("💚 Após escanear, aguarde até a conexão ser estabelecida...\n"));
 });
 
 client.on("ready", () => {
-  console.log(chalk.green("✅ WhatsApp conectado e pronto para recuperação de Pix!"));
+  console.log(chalk.green("✅ WhatsApp conectado e pronto!"));
 });
 
 client.initialize();
 
-// ----------------------
-// FILA DE MENSAGENS
-// ----------------------
-const messageQueue = [];
-let isProcessing = false;
+// ==============================
+// LÓGICA DE PEDIDOS E PAGAMENTOS
+// ==============================
+const pendingOrders = new Map(); // Armazena pedidos pendentes (aguardando 10 min)
 
-async function processQueue() {
-  if (isProcessing || messageQueue.length === 0) return;
-
-  isProcessing = true;
-  const { phone, message } = messageQueue.shift();
-
+// Função para enviar mensagem no WhatsApp
+async function enviarMensagemPixNaoPago(phone, name, total) {
   try {
     const formatted = phone.replace(/\D/g, "");
     const numberId = await client.getNumberId(formatted);
 
     if (!numberId) {
       console.log(chalk.red(`⚠️ O número ${phone} não tem WhatsApp.`));
-      isProcessing = false;
       return;
     }
 
     const chat = await client.getChatById(numberId._serialized);
+
+    const message = `Eiii *${name}*, obrigado pela sua compra! 🩷💚  
+Fico muito feliz em ter você como cliente da *AquaFit Brasil*! 💖  
+
+Meu nome é *Carolina* e percebi que o pagamento via Pix ainda não foi feito. Você teve algum problema? 🤔  
+
+Caso prefira, você pode fazer o Pix diretamente para nossa chave CNPJ no valor de *R$${total}*, e enviar o comprovante por aqui mesmo para que eu atualize no sistema.  
+
+💸 *Chave Pix (CNPJ):* 52757947000145  
+🏢 *Quem receberá:* JVL NEGÓCIOS DIGITAIS LTDA (Razão social da AquaFit Brasil)
+
+Se ficou alguma dúvida sobre o pedido, estou à disposição 😉`;
+
     await chat.sendMessage(message);
     console.log(chalk.green(`✅ Mensagem enviada para ${phone}`));
   } catch (err) {
     console.error(chalk.red("❌ Erro ao enviar mensagem:"), err);
   }
-
-  setTimeout(() => {
-    isProcessing = false;
-    processQueue();
-  }, 5 * 60 * 1000); // 5 min entre mensagens (anti-ban)
 }
 
-// ----------------------
-// MONITORA PEDIDOS (10 min delay)
-// ----------------------
-const pendingOrders = new Map(); // armazena pedidos Pix pendentes
-
+// ==============================
+// WEBHOOK: PEDIDO CRIADO (PENDING PIX)
+// ==============================
 app.post("/shopify", async (req, res) => {
   try {
     const data = req.body;
+    const status = data.financial_status;
+    const paymentMethod = data.gateway || data.payment_gateway_names?.[0];
 
     console.log(chalk.yellow("\n🔔 NOVO WEBHOOK RECEBIDO ---------------------"));
     console.log(`🧾 Pedido: ${data.name}`);
-    console.log(`💰 Status financeiro: ${data.financial_status}`);
-    console.log(`💳 Método de pagamento: ${data.gateway}`);
+    console.log(`💰 Status financeiro: ${status}`);
+    console.log(`💳 Método de pagamento: ${paymentMethod}`);
     console.log(`👤 Cliente: ${data.customer?.first_name || "não informado"}`);
 
     const phone =
       data.billing_address?.phone ||
       data.shipping_address?.phone ||
       data.customer?.phone ||
-      data.phone ||
       null;
 
     console.log(`📞 Telefone: ${phone || "não informado"}`);
     console.log("------------------------------------------------");
 
-    // SE O PEDIDO FOR PAGO — remove da fila, se existir
-    if (data.financial_status === "paid") {
-      if (pendingOrders.has(data.name)) {
-        clearTimeout(pendingOrders.get(data.name));
-        pendingOrders.delete(data.name);
-        console.log(chalk.green(`✅ Pedido ${data.name} foi pago — envio cancelado.`));
-      } else {
-        console.log(chalk.gray(`💚 Pedido ${data.name} pago — nada pendente.`));
-      }
-      return res.status(200).send("Pagamento confirmado, sem ação necessária.");
-    }
+    if (!phone) return res.status(200).send("Sem telefone");
 
-    // SE O PEDIDO FOR PIX PENDENTE — agenda para checar em 10 minutos
-    if (data.gateway === "pix" && data.financial_status === "pending" && phone) {
-      console.log(chalk.magenta(`⏳ Pedido ${data.name} via Pix pendente — aguardando 10 minutos...`));
+    // Se for PIX e estiver pendente, agenda verificação
+    if (
+      status === "pending" &&
+      paymentMethod &&
+      paymentMethod.toLowerCase().includes("pix")
+    ) {
+      console.log(chalk.blue(`🕒 Pedido ${data.name} aguardando 10 minutos para verificar pagamento...`));
 
-      const timeout = setTimeout(async () => {
-        // Se ainda estiver pendente (não cancelado nem pago)
-        if (!pendingOrders.has(data.name)) return;
+      const order = {
+        id: data.id,
+        name: data.name,
+        customer: data.customer?.first_name || "cliente",
+        phone,
+        total: data.total_price || "0,00",
+      };
 
-        const message = `Eiii *${
-          data.customer?.first_name || "cliente"
-        }*, obrigado pela sua compra, fico muito feliz em ter você como cliente *AquaFit Brasil* 🩷💚
+      // Armazena o pedido
+      pendingOrders.set(order.id, order);
 
-Meu nome é *Carolina* e percebi que o pagamento via *Pix* ainda não foi feito, você teve algum problema?
-
-Caso prefira e ache mais fácil, você pode fazer o *pix* no valor de *R$${data.total_price}* do seu pedido e encaminhar o comprovante por aqui mesmo para que eu atualize no sistema.
-
-*Chave Pix CNPJ:* 52757947000145  
-*Quem receberá:* JVL NEGÓCIOS DIGITAIS LTDA — (Razão social da empresa AquaFit Brasil)
-
-Caso tenha tido alguma dúvida em relação ao pedido, estou à disposição 😉`;
-
-        messageQueue.push({ phone, message });
-        processQueue();
-
-        pendingOrders.delete(data.name);
+      // Aguarda 10 minutos
+      setTimeout(async () => {
+        // Se o pagamento ainda não foi confirmado
+        if (pendingOrders.has(order.id)) {
+          console.log(chalk.yellow(`⏳ Pagamento do pedido ${order.name} ainda pendente após 10 minutos.`));
+          await enviarMensagemPixNaoPago(order.phone, order.customer, order.total);
+          pendingOrders.delete(order.id);
+        }
       }, 10 * 60 * 1000); // 10 minutos
-
-      pendingOrders.set(data.name, timeout);
     }
 
-    res.status(200).send("Webhook recebido");
+    res.status(200).send("Webhook recebido com sucesso");
   } catch (err) {
-    console.error(chalk.red("❌ Erro ao processar webhook:"), err);
+    console.error(chalk.red("❌ Erro no webhook:"), err);
     res.status(500).send("Erro interno");
   }
 });
 
-// ----------------------
-// RESPOSTAS AUTOMÁTICAS
-// ----------------------
-client.on("message", async (msg) => {
+// ==============================
+// WEBHOOK: PAGAMENTO CONFIRMADO
+// ==============================
+app.post("/payment", async (req, res) => {
   try {
-    if (msg.fromMe) return;
+    const data = req.body;
 
-    if (!msg.body || msg.body.trim().length === 0 || msg.body === "undefined") return;
+    if (data.financial_status === "paid" && pendingOrders.has(data.id)) {
+      console.log(chalk.green(`💚 Pagamento confirmado para o pedido ${data.name}.`));
+      pendingOrders.delete(data.id);
+    }
 
-    const contato = msg._data?.notifyName || msg.from.split("@")[0];
-    console.log(chalk.yellow(`💬 Mensagem recebida de ${contato}: ${msg.body}`));
-
-    const resposta = `💬 Oi *${contato.split(" ")[0]}*!  
-Esse número é usado apenas para mensagens automáticas.  
-Para falar com nossa equipe de atendimento humano, chame:  
-📞 *+55 (19) 98773-6747* 💚`;
-
-    await msg.reply(resposta);
-    console.log(chalk.green(`🤖 Resposta automática enviada para ${contato}`));
+    res.status(200).send("Pagamento processado");
   } catch (err) {
-    console.error(chalk.red("❌ Erro ao responder mensagem:"), err);
+    console.error(chalk.red("❌ Erro no webhook de pagamento:"), err);
+    res.status(500).send("Erro interno");
   }
 });
 
-// ----------------------
-// SERVIDOR
-// ----------------------
+// ==============================
+// INICIA SERVIDOR
+// ==============================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(chalk.blue(`🌐 Servidor rodando na porta ${PORT}`)));
+app.listen(PORT, () => {
+  console.log(chalk.blue(`🌐 Servidor rodando na porta ${PORT}`));
+});
