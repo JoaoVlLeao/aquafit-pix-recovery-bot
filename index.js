@@ -4,14 +4,14 @@ import qrcode from "qrcode-terminal";
 import pkg from "whatsapp-web.js";
 import chalk from "chalk";
 
-const { Client, LocalAuth } = pkg;
+const { Client, LocalAuth, MessageMedia } = pkg;
 
 const app = express();
 app.use(bodyParser.json());
 
-// ----------------------
+// ===========================
 // INICIALIZA WHATSAPP
-// ----------------------
+// ===========================
 const client = new Client({
   authStrategy: new LocalAuth({
     dataPath: "./session",
@@ -30,7 +30,13 @@ const client = new Client({
   },
 });
 
+// Controla frequência de exibição do QR code (a cada 2 minutos)
+let lastQRTime = 0;
 client.on("qr", (qr) => {
+  const now = Date.now();
+  if (now - lastQRTime < 120000) return;
+  lastQRTime = now;
+
   const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qr)}`;
   console.log(chalk.cyan("\n📱 Escaneie o QR code no navegador:"));
   console.log(chalk.yellow(qrUrl));
@@ -43,130 +49,140 @@ client.on("ready", () => {
 
 client.initialize();
 
-// ----------------------
-// FILA DE MENSAGENS (anti-banimento)
-// ----------------------
-const messageQueue = [];
-let isProcessing = false;
+// ===========================
+// GERENCIAMENTO DE PEDIDOS
+// ===========================
+const pendingOrders = new Map(); // armazena pedidos pendentes
 
-async function processQueue() {
-  if (isProcessing || messageQueue.length === 0) return;
-
-  isProcessing = true;
-  const { phone, message } = messageQueue.shift();
-
+// ===========================
+// FUNÇÃO PARA ENVIAR MENSAGEM
+// ===========================
+async function sendPixReminder(phone, name, order, total) {
   try {
     const formatted = phone.replace(/\D/g, "");
     const numberId = await client.getNumberId(formatted);
     if (!numberId) {
       console.log(chalk.red(`⚠️ O número ${phone} não tem WhatsApp.`));
-      isProcessing = false;
       return;
     }
 
     const chat = await client.getChatById(numberId._serialized);
-    await chat.sendMessage(message);
-    console.log(chalk.green(`✅ Mensagem enviada para ${phone}`));
-  } catch (err) {
-    console.error(chalk.red("❌ Erro ao enviar mensagem:"), err);
-  }
+    const message = `Eiii *${name}*, obrigado pela sua compra! 💚  
+Fico muito feliz em ter você como cliente *AquaFit Brasil* 🩷  
 
-  setTimeout(() => {
-    isProcessing = false;
-    processQueue();
-  }, 5 * 60 * 1000); // 5 minutos entre mensagens
+Meu nome é *Carolina* e percebi que o pagamento via *Pix* ainda não foi concluído, você teve algum problema?
+
+Caso prefira, você pode pagar o valor de *R$${total}* enviando o Pix direto para nossa chave abaixo 👇  
+
+💸 *Chave Pix CNPJ:* 52757947000145  
+🏢 *Quem receberá:* JVL NEGÓCIOS DIGITAIS LTDA (Razão social da AquaFit Brasil)
+
+Assim que enviar, me encaminhe o comprovante por aqui mesmo pra eu atualizar o sistema rapidinho 💚  
+Qualquer dúvida, estou à disposição 😉`;
+
+    await chat.sendMessage(message);
+    console.log(chalk.green(`✅ Mensagem de recuperação enviada para ${name} (${phone})`));
+  } catch (err) {
+    console.error(chalk.red("❌ Erro ao enviar mensagem:"), err.message);
+  }
 }
 
-// ----------------------
-// ENDPOINT /shopify (Webhook)
-// ----------------------
+// ===========================
+// ENDPOINT /shopify
+// ===========================
 app.post("/shopify", async (req, res) => {
   try {
     const data = req.body;
 
-    console.log(chalk.yellow("\n🔔 NOVO WEBHOOK RECEBIDO ---------------------"));
-    console.log(`🧾 Pedido: ${data.name}`);
-    console.log(`💰 Status financeiro: ${data.financial_status}`);
-    console.log(`💳 Método de pagamento: ${data.payment_gateway_names?.[0] || "não informado"}`);
-    console.log(`👤 Cliente: ${data.customer?.first_name || "não informado"}`);
-
+    const name = data.customer?.first_name || "Cliente";
     const phone =
       data.billing_address?.phone ||
       data.shipping_address?.phone ||
       data.customer?.phone ||
-      data.phone ||
       null;
 
+    const financialStatus = data.financial_status || "não informado";
+    const paymentMethod = data.gateway || "não informado";
+    const orderName = data.name || "sem nome";
+    const total = data.total_price || "0.00";
+
+    console.log(chalk.yellow("\n🔔 NOVO WEBHOOK RECEBIDO ---------------------"));
+    console.log(`🧾 Pedido: ${orderName}`);
+    console.log(`💰 Status financeiro: ${financialStatus}`);
+    console.log(`💳 Método de pagamento: ${paymentMethod}`);
+    console.log(`👤 Cliente: ${name}`);
     console.log(`📞 Telefone: ${phone || "não informado"}`);
     console.log("------------------------------------------------");
 
-    // Verifica se é PIX (ou método ainda não definido)
-    const isPix =
-      !data.payment_gateway_names ||
-      data.payment_gateway_names.length === 0 ||
-      data.payment_gateway_names.includes("pix");
-
-    if (!isPix) {
-      console.log(chalk.gray(`⚠️ Pedido ${data.name} ignorado (não é PIX)`));
-      return res.status(200).send("Ignorado - não é PIX");
-    }
-
-    if (data.financial_status !== "pending") {
-      console.log(chalk.gray(`⚠️ Pedido ${data.name} ignorado (status: ${data.financial_status})`));
-      return res.status(200).send("Ignorado - já pago ou cancelado");
-    }
-
+    // Ignora se não tiver telefone
     if (!phone) {
-      console.log(chalk.red(`❌ Pedido ${data.name} sem telefone — não foi possível enviar mensagem.`));
+      console.log(chalk.red(`❌ Pedido ${orderName} sem telefone — ignorado.`));
       return res.status(200).send("Sem telefone");
     }
 
-    const nome = data.customer?.first_name || "cliente";
-    const valor = data.total_price || "0.00";
-
-    const message = `Eiii *${nome}*, obrigado pela sua compra, fico muito feliz em ter você como cliente *AquaFit Brasil* 🩷💚
-
-Meu nome é *Carolina* e percebi que o pagamento via *Pix* não foi feito, você teve algum problema?
-
-Caso prefira e ache mais fácil, você pode fazer o pix para nossa chave *CNPJ* no valor de *R$${valor}* do seu pedido e encaminhar o comprovante por aqui mesmo para que eu atualize no sistema.
-
-*Chave Pix CNPJ:* 52757947000145  
-*Quem receberá:* JVL NEGÓCIOS DIGITAIS LTDA (Razão social da AquaFit Brasil)
-
-Caso tenha tido alguma dúvida em relação ao pedido estou à disposição 😉`;
-
-    console.log(chalk.blue(`🕒 Aguardando 10 minutos antes de enviar mensagem para ${phone}...`));
-
-    // Aguarda 10 minutos antes de verificar novamente o status e enviar
-    setTimeout(async () => {
-      try {
-        // Aqui você poderia consultar novamente a API da Shopify
-        // e verificar se o status do pedido mudou pra "paid" antes de enviar.
-
-        // Exemplo simplificado:
-        if (data.financial_status === "pending") {
-          messageQueue.push({ phone, message });
-          console.log(chalk.magenta(`💌 Mensagem de recuperação agendada para ${phone}`));
-          processQueue();
-        } else {
-          console.log(chalk.gray(`✅ Pedido ${data.name} já foi pago — mensagem não enviada.`));
-        }
-      } catch (err) {
-        console.error(chalk.red("❌ Erro no agendamento da mensagem:"), err);
+    // Se for pago → cancela qualquer agendamento anterior
+    if (financialStatus === "paid") {
+      if (pendingOrders.has(orderName)) {
+        clearTimeout(pendingOrders.get(orderName));
+        pendingOrders.delete(orderName);
+        console.log(chalk.green(`✅ Pedido ${orderName} pago — lembrete cancelado.`));
+      } else {
+        console.log(chalk.gray(`⚠️ Pedido ${orderName} pago — nenhum lembrete pendente.`));
       }
-    }, 10 * 60 * 1000); // 10 minutos
+      return res.status(200).send("Pagamento confirmado");
+    }
 
-    res.status(200).send("Verificação agendada para pedido PIX");
+    // Se for pendente → agenda envio em 10 minutos
+    if (financialStatus === "pending") {
+      if (pendingOrders.has(orderName)) {
+        console.log(chalk.gray(`⏳ Pedido ${orderName} já agendado, ignorando duplicata.`));
+        return res.status(200).send("Já agendado");
+      }
+
+      console.log(chalk.blue(`🕒 Aguardando 10 minutos antes de enviar mensagem para ${phone}...`));
+
+      const timeout = setTimeout(() => {
+        sendPixReminder(phone, name, orderName, total);
+        pendingOrders.delete(orderName);
+      }, 10 * 60 * 1000);
+
+      pendingOrders.set(orderName, timeout);
+      return res.status(200).send("Agendado para envio em 10 minutos");
+    }
+
+    console.log(chalk.gray(`⚠️ Pedido ${orderName} ignorado (status: ${financialStatus})`));
+    res.status(200).send("Ignorado");
   } catch (err) {
     console.error(chalk.red("❌ Erro ao processar webhook:"), err);
     res.status(500).send("Erro interno");
   }
 });
 
-// ----------------------
-// SERVIDOR LOCAL / RAILWAY
-// ----------------------
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(chalk.blue(`🌐 Servidor rodando na porta ${PORT}`));
+// ===========================
+// RESPOSTA AUTOMÁTICA
+// ===========================
+client.on("message", async (msg) => {
+  try {
+    if (msg.fromMe || !msg.body || msg.body === "undefined" || msg.body.trim().length === 0) return;
+
+    const contato = msg._data?.notifyName || msg.from.split("@")[0];
+    console.log(chalk.yellow(`💬 Mensagem recebida de ${contato}: ${msg.body}`));
+
+    const resposta = `💬 Oi *${contato.split(" ")[0]}*! Tudo bem?  
+Esse número é usado apenas para *mensagens automáticas* da *AquaFit Brasil*.  
+
+📞 Para falar com nossa equipe humana, mande mensagem para:  
+➡️ *+55 (19) 98773-6747* 💚`;
+
+    await msg.reply(resposta);
+    console.log(chalk.green(`🤖 Resposta automática enviada para ${contato}`));
+  } catch (err) {
+    console.error(chalk.red("❌ Erro ao responder mensagem:"), err);
+  }
 });
+
+// ===========================
+// SERVIDOR
+// ===========================
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(chalk.blue(`🌐 Servidor rodando na porta ${PORT}`)));
